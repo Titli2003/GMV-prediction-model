@@ -1,0 +1,148 @@
+%%writefile fastapi_app.py
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from pydantic import BaseModel
+from typing import List
+import pandas as pd
+import numpy as np
+import joblib
+import os
+from datetime import datetime, timedelta
+
+app = FastAPI()
+
+# === Load Artifacts ===
+model = joblib.load("model.pk1")
+scaling_params = joblib.load("scaling_params.pk1")
+regressor_medians = joblib.load("regressors_median.pk1")
+log_transform_applies = joblib.load("log_transform_applies.pk1")
+cap_value = joblib.load("cap_value.pk1")
+last_row = pd.read_csv("last_row.csv")
+
+# === File Paths ===
+HISTORY_CSV = "history.csv"
+PREDICTION_LOG = "prediction_log.csv"
+
+# === Pydantic Schema ===
+class DailyFeature(BaseModel):
+    order_date: str
+    total_orders: float
+    tiscon_orders: float
+    non_tiscon_orders: float
+    tiscon_revenue: float
+    non_tiscon_revenue: float
+    avg_items_tiscon: float
+    avg_items_non_tiscon: float
+
+# === Helper Functions ===
+def create_lag_features(data):
+    for lag in [1, 2, 3, 7, 14]:
+        data[f'y_lag{lag}'] = data['y'].shift(lag)
+    data['y_rolling7'] = data['y'].rolling(window=7, min_periods=1).mean().shift(1)
+    return data
+
+def update_history(new_row: pd.DataFrame):
+    if os.path.exists(HISTORY_CSV):
+        df = pd.read_csv(HISTORY_CSV, parse_dates=['ds'])
+        df = pd.concat([df, new_row], ignore_index=True)
+    else:
+        df = new_row
+    df = df.sort_values('ds')
+    df = create_lag_features(df)
+    df.to_csv(HISTORY_CSV, index=False)
+    return df
+
+# === API Endpoints ===
+@app.post("/update_features")
+def update_features(data: DailyFeature):
+    try:
+        row = data.dict()
+        row['ds'] = pd.to_datetime(row.pop("order_date"))
+        row['y'] = row['tiscon_revenue'] + row['non_tiscon_revenue']
+
+        if log_transform_applies:
+            row['y'] = np.log(row['y'])
+
+        row['cap'] = cap_value
+
+        for key, val in regressor_medians.items():
+            row[key] = row.get(key, val)
+
+        row_df = pd.DataFrame([row])
+        full_df = update_history(row_df)
+
+        return {"message": "Features updated successfully", "latest_date": row['ds']}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/predict_gmv")
+def predict_gmv(start_date: str = '2025-06-20', end_date: str = '2025-10-31'):
+    try:
+        future_dates = pd.date_range(start=start_date, end=end_date)
+        future_df = pd.DataFrame({'ds': future_dates})
+        for reg in regressor_medians:
+            future_df[reg] = regressor_medians[reg]
+        for reg in ['y_lag7', 'y_rolling7']:
+            future_df[reg] = last_row[reg].values[0]
+        future_df['cap'] = cap_value
+        forecast = model.predict(future_df)
+        if log_transform_applies:
+            forecast['yhat'] = np.exp(forecast['yhat'])
+            forecast['yhat_lower'] = np.exp(forecast['yhat_lower'])
+            forecast['yhat_upper'] = np.exp(forecast['yhat_upper'])
+        forecast['yhat'] = np.interp(forecast['yhat'],
+                                     (scaling_params['min_yhat'], scaling_params['max_yhat']),
+                                     (scaling_params['min_cr'], scaling_params['max_cr']))
+        forecast['yhat_lower'] = np.interp(forecast['yhat_lower'],
+                                           (scaling_params['min_yhat'], scaling_params['max_yhat']),
+                                           (scaling_params['min_cr'], scaling_params['max_cr']))
+        forecast['yhat_upper'] = np.interp(forecast['yhat_upper'],
+                                           (scaling_params['min_yhat'], scaling_params['max_yhat']),
+                                           (scaling_params['min_cr'], scaling_params['max_cr']))
+        forecast[['ds', 'yhat']].to_csv(PREDICTION_LOG, index=False)
+        return forecast[['ds', 'yhat']].to_dict(orient='records')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/download_forecast")
+def download_forecast():
+    try:
+        if not os.path.exists(PREDICTION_LOG):
+            raise HTTPException(status_code=404, detail="No forecast found")
+        df = pd.read_csv(PREDICTION_LOG)
+        return df.to_dict(orient='records')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/auto_update_and_predict")
+def auto_update_and_predict():
+    try:
+        url = "https://api.rjmetrics.com/0.1/figure/2600143/export"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise Exception("Failed to fetch data")
+        df = pd.read_csv(pd.compat.StringIO(response.text))
+
+        latest = df.iloc[-1]
+        row = {
+            'ds': pd.to_datetime(latest['order_date']),
+            'total_orders': latest['total_orders'],
+            'tiscon_orders': latest['tiscon_orders'],
+            'non_tiscon_orders': latest['non_tiscon_orders'],
+            'tiscon_revenue': latest['tiscon_revenue'],
+            'non_tiscon_revenue': latest['non_tiscon_revenue'],
+            'avg_items_tiscon': latest['avg_items_tiscon'],
+            'avg_items_non_tiscon': latest['avg_items_non_tiscon'],
+        }
+        row['y'] = row['tiscon_revenue'] + row['non_tiscon_revenue']
+        if log_transform_applies:
+            row['y'] = np.log(row['y'])
+        row['cap'] = cap_value
+        for key, val in regressor_medians.items():
+            row[key] = row.get(key, val)
+
+        row_df = pd.DataFrame([row])
+        update_history(row_df)
+
+        # 3. Trigger forecast
+        return predict_gmv()
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -1,0 +1,313 @@
+import sys 
+print(sys.executable)
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from prophet import Prophet
+from prophet.diagnostics import cross_validation, performance_metrics
+from sklearn.metrics import mean_absolute_percentage_error
+import time
+from datetime import datetime
+import os
+
+%matplotlib inline
+# --- Updated Dataset Integration Section ---
+
+import pandas as pd
+import numpy as np
+import os
+
+DATE_COLUMN_NAME = 'order_date'
+SHEET_NAME = 'Sheet1'
+
+# Load datasets
+csv_file_path = r"C:\Users\KIIT\Downloads\GMV365daysdata.csv"
+xlsx_newdata_path = r"C:\Users\KIIT\Downloads\final_modified_gmv_dataset (1).xlsx"
+xlsx_regressor_path = r"C:\Users\KIIT\Downloads\final_dataset_appended_2025-06-10_to_18_above_0609.xlsx"
+
+# Ensure files exist
+assert os.path.exists(csv_file_path), f"CSV File not found: {csv_file_path}"
+assert os.path.exists(xlsx_newdata_path), f"XLSX File not found: {xlsx_newdata_path}"
+assert os.path.exists(xlsx_regressor_path), f"XLSX File not found: {xlsx_regressor_path}"
+
+# Read files
+df_base = pd.read_csv(csv_file_path)
+df_new = pd.read_excel(xlsx_newdata_path, sheet_name=SHEET_NAME)
+df_reg = pd.read_excel(xlsx_regressor_path, sheet_name=SHEET_NAME)
+
+# Clean date columns
+df_base[DATE_COLUMN_NAME] = pd.to_datetime(df_base[DATE_COLUMN_NAME])
+df_new[DATE_COLUMN_NAME] = pd.to_datetime(df_new[DATE_COLUMN_NAME])
+df_reg[DATE_COLUMN_NAME] = pd.to_datetime(df_reg[DATE_COLUMN_NAME])
+
+# Merge original base + new data
+df_merged = pd.concat([df_base, df_new], ignore_index=True)
+df_merged = df_merged.drop_duplicates(subset=[DATE_COLUMN_NAME])
+
+# Merge with regressors
+df = pd.merge(df_merged, df_reg, on=DATE_COLUMN_NAME, how='left')
+
+print("\n All datasets loaded and merged.")
+
+required_columns = [
+
+    'order_date', 'tiscon_revenue',
+
+    'total_orders', 'tiscon_orders', 'non_tiscon_orders', 'non_tiscon_revenue',
+
+    'avg_items_tiscon', 'avg_items_non_tiscon', 'stock_price','steel_price','economic_factor_war','discount'
+
+]
+
+missing = [col for col in required_columns if col not in df.columns]
+if missing:
+    raise ValueError(f" Missing columns in uploaded file: {missing}")
+else:
+    print(" All required columns are present.")
+print(df.columns.tolist())
+import warnings
+warnings.filterwarnings('ignore')
+df['gmv'] = df['tiscon_revenue'] + df['non_tiscon_revenue']
+TARGET_COLUMN_NAME ='gmv'
+df[DATE_COLUMN_NAME] = pd.to_datetime(df[DATE_COLUMN_NAME])
+df = df.sort_values(DATE_COLUMN_NAME)
+df.rename(columns={DATE_COLUMN_NAME: 'ds', TARGET_COLUMN_NAME: 'y'}, inplace=True)
+if(df['y'] > 0).all():
+    df['y'] = np.log(df['y'])
+    print(" 'gmv' (y) column has been log transformed.")
+else:
+    print(" 'gmv' (y) contains non_positive values , skipping log transform.")
+regressors = required_columns[2:]  # all except date and target
+for reg in regressors:
+    df[reg] = pd.to_numeric(df[reg], errors='coerce')
+    df[reg] = df[reg].fillna(method='ffill').fillna(method='bfill')
+    df[reg] = df[reg].fillna(df[reg].median())
+df.dropna(subset=['y'], inplace=True)
+if 'y_log_transformed' in locals() and y_log_transformed:
+    df['cap'] = np.log(df_raw[TARGET_COLUMN_NAME].max()*1.2)
+else:
+    df['cap'] = df['y'].max() * 1.05 
+print(" cap value for forecasting:", df['cap'].iloc[-1])
+def create_lag_features(data):
+
+    for lag in [1, 2, 3, 7,14]:
+
+        data[f'y_lag{lag}'] = data['y'].shift(lag)
+
+    data['y_rolling7'] = data['y'].rolling(window=7, min_periods=1).mean().shift(1)
+
+    return data
+
+ 
+
+df = create_lag_features(df)
+
+df.dropna(inplace=True)
+train_size = int(len(df) * 0.65) 
+
+train_df = df.iloc[:train_size].copy()
+
+test_df = df.iloc[train_size:].copy()
+model = Prophet(
+
+    seasonality_mode='additive' if (df['y'] > 0).all() else 'multiplicative',
+
+    changepoint_prior_scale=0.02, 
+
+    seasonality_prior_scale=5.0, 
+
+    changepoint_range=0.9,
+
+    weekly_seasonality=True,
+
+    daily_seasonality=False,
+
+)
+
+model.add_seasonality(name='monthly', period=30.5, fourier_order=10)
+
+final_regressors = regressors + [ 'y_lag7','y_rolling7'] 
+
+for reg in final_regressors:
+
+    model.add_regressor(reg)
+
+fit_cols = ['ds', 'y', 'cap'] + final_regressors
+
+start_time = time.time()
+
+model.fit(train_df[fit_cols])
+
+print(f" Model trained in {time.time() - start_time:.2f} seconds")
+from prophet.diagnostics import cross_validation, performance_metrics
+
+df_cv= cross_validation(
+
+    model,
+
+    initial='180 days',
+
+    period = '15 days',
+
+    horizon = '30 days',
+
+    parallel= "processes"
+
+)
+
+df_p = performance_metrics(df_cv)
+
+df_p[['horizon','mape','rmse','mae']].head()
+future_test = test_df[['ds', 'cap'] + final_regressors].copy()
+
+forecast = model.predict(future_test)
+
+if 'y_log_transformed'in locals() and y_log_transformed:
+
+    forecast['yhat'] = np.exp(forecast['yhat'] )
+
+    forecast['yhat_lower'] = np.exp(forecast['yhat_lower'] )
+
+    forecast['yhat_upper'] = np.exp(forecast['yhat_upper'] )
+
+    test_df['y_original'] = np.exp(test_df['y'])
+
+    comparison = pd.merge(test_df[['ds', 'y_original']], forecast[['ds', 'yhat']], on='ds')
+
+    y_true = comparison['y_original']
+
+else:    
+
+    comparison = pd.merge(test_df[['ds', 'y']], forecast[['ds', 'yhat']], on='ds')
+y_true = comparison['y']
+
+y_pred = forecast['yhat'].clip(lower=0)
+
+mape = mean_absolute_percentage_error(y_true, y_pred)
+
+accuracy = max(0, 1 - mape)
+
+ 
+
+print(f"\nTest MAPE: {mape:.2%}")
+
+print(f" Accuracy: {accuracy:.2%}")
+
+ 
+
+fig1 = model.plot(forecast)
+
+plt.plot(comparison['ds'], comparison['y'], 'r.', label='Actual')
+
+plt.legend()
+
+plt.title('Test Forecast vs Actual')
+
+plt.show()
+from datetime import timedelta
+import joblib
+future_dates = pd.date_range(start='2025-06-01',end='2025-10-31')
+future_period = len(future_dates)
+future_df = pd.DataFrame({'ds': future_dates})
+joblib.dump(model,"model.pk1")
+log_df = df.copy()
+if (log_df['y'] > 0).all():
+    log_df['y'] = np.log(log_df['y'])
+
+log_df = create_lag_features(log_df)
+log_df.dropna(inplace=True)
+
+last_row = log_df[['y_lag7','y_rolling7']].iloc[-1:]
+last_row.to_csv("last_row.csv", index=False)
+
+print("\nLast non-null lag row used:")
+print(last_row)
+for reg in final_regressors:
+    if 'lag' in reg or 'rolling' in reg:
+        future_df[reg] = last_row[reg].values[0]
+    else:
+        future_df[reg] = df[reg].median()
+forecast = model.predict(future_df)
+forecast = forecast[forecast['ds']> pd.Timestamp.today()]
+from datetime import date
+forecast[['ds','yhat']].to_csv(f"forecast_log_{date.today()}.csv", index=False)
+forecast['yhat'] = np.exp(forecast['yhat'])
+forecast['yhat_lower'] = np.exp(forecast['yhat_lower'])
+forecast['yhat_upper'] = np.exp(forecast['yhat_upper'])
+df['gmv'] = df['tiscon_revenue'] +df['non_tiscon_revenue']
+min_cr = df['gmv'].min()
+max_cr = df['gmv'].max()
+min_yhat,max_yhat = forecast['yhat'].min() , forecast['yhat'].max()
+forecast['yhat']= np.interp(forecast['yhat'],(min_yhat,max_yhat),(min_cr,max_cr))
+forecast['yhat_lower']= np.interp(forecast['yhat_lower'],(min_yhat,max_yhat),(min_cr,max_cr))
+forecast['yhat_upper']= np.interp(forecast['yhat_upper'],(min_yhat,max_yhat),(min_cr,max_cr))
+joblib.dump({'min_cr':min_cr,'max_cr':max_cr,'min_yhat':min_yhat,'max_yhat':max_yhat},"scaling_params.pk1")
+joblib.dump({reg:df[reg].median() for reg in regressors},"regressors_median.pk1")
+joblib.dump(True,"log_transform_applies.pk1")
+joblib.dump(df['cap'].iloc[-1],"cap_value.pk1")
+today = datetime.today().date()
+tomorrow = today +timedelta(days = 1)
+forecast = forecast[forecast['ds'].dt.date >= tomorrow].copy()
+forecast.reset_index(drop = True , inplace = True)
+forecast['month'] = forecast['ds'].dt.to_period('M')
+monthly_gmv = forecast.groupby('month')['yhat'].sum().reset_index()
+monthly_gmv['gmv_crore'] = monthly_gmv['yhat'] / 1e7
+monthly_gmv['month_str'] = monthly_gmv['month'].dt.strftime('%B %Y')
+print("\nMonthly Total GMV (Forecast):")
+print(monthly_gmv[['month_str', 'gmv_crore']].to_string(index=False, header=['Month', 'GMV (Cr)']))
+plt.figure(figsize=(12, 5))
+plt.bar(monthly_gmv['month_str'], monthly_gmv['gmv_crore'], color='orange')
+plt.title("Monthly Total GMV (Forecast)")
+plt.xlabel("Month")
+plt.ylabel("Total GMV in Cr")
+plt.xticks(rotation=45)
+plt.grid(axis='y')
+plt.tight_layout()
+plt.show()
+print("\nNext 5 months Daily GMV Forecast:")
+for _, row in forecast.iterrows():
+    date_str = row['ds'].strftime('%Y-%m-%d (%A)')
+    gmv_crore = row['yhat'] / 1e7
+    print(f"{date_str}: ₹{gmv_crore:.2f}Cr")
+forecast['day_of_week'] = forecast['ds'].dt.day_name()
+day_avg = forecast.groupby('day_of_week')['yhat'].mean().reindex([
+    'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'
+
+])
+plt.figure(figsize=(10, 4))
+day_avg.plot(kind='bar', title='Avg GMV by Day of Week (Next 5 Months)', ylabel='GMV', color='skyblue')
+plt.xticks(rotation=45)
+plt.grid(axis='y')
+plt.tight_layout()
+plt.show()
+top_day = day_avg.idxmax()
+bottom_day = day_avg.idxmin()
+top_month = monthly_gmv.loc[monthly_gmv['gmv_crore'].idxmax(), 'month_str']
+bottom_month = monthly_gmv.loc[monthly_gmv['gmv_crore'].idxmin(), 'month_str']
+print("\nInsights based on Forecasted GMV (Next 5 Months):")
+print(f"1. Highest average GMV occurs on: {top_day}")
+if top_day in ['Saturday', 'Sunday']:
+    print("   → People tend to buy more on weekends in the forecast period.")
+else:
+    print("   → Buying peaks during weekdays, possibly due to business or bulk orders.")
+print(f"\n2. Month with highest forecasted GMV: {top_month}")
+print(f"   Month with lowest forecasted GMV: {bottom_month}")
+month_notes = {
+    'December 2024': "Holiday shopping expected to boost GMV.",
+    'January 2025': "Post-holiday sales slump anticipated.",
+    'August 2025': "Forecast period ends; seasonal trends may affect numbers."
+}
+print(f"   → Note on months: {month_notes.get(top_month, 'No special seasonality noted for this month.')}")
+print(f"\n3. Forecast Accuracy on Historical Data: {accuracy:.2%}")
+if accuracy < 0.75:
+    print("   → Model performance is below ideal. Consider enhancing regressors, lag features, or hyperparameter tuning.")
+elif accuracy > 0.90:
+    print("   → Excellent forecast quality.")
+else:
+    print("   → Moderate performance. Acceptable, but can be further improved.") 
+print("\n4. Daily GMV forecast (₹ Crores) highlights:")
+for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
+    avg_gmv = day_avg.get(day, 0) / 1e7
+    print(f"   {day}: ₹{avg_gmv:.2f} Cr on average")
+print("\nRefer to the generated bar charts for monthly totals and daily average GMV trends.") 
